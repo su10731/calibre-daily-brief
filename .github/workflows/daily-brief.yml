@@ -40,27 +40,31 @@ jobs:
 
       - name: 安装中文字体和 Calibre
         run: |
-          set -euo pipefail
-          echo "::group::系统信息"
-          . /etc/os-release; echo "发行版：$PRETTY_NAME"; uname -m
+          # 注意：这里故意不加 -e。整段安装先跑完并留日志，最后再决定退出码，
+          # 目的是把真实报错写进 Job Summary（公开可见），而不是只留在需要登录才能看的日志里。
+          set -uo pipefail
+          log=/tmp/install.log
+          {
+            . /etc/os-release; echo "发行版：$PRETTY_NAME"; uname -m
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y --no-install-recommends \
+              ca-certificates wget xz-utils fonts-noto-cjk
+            sudo -v
+            wget -nv -O /tmp/calibre-installer.sh https://download.calibre-ebook.com/linux-installer.sh
+            echo "安装脚本首行：$(head -n 1 /tmp/calibre-installer.sh)"
+            sudo bash /tmp/calibre-installer.sh
+          } > "$log" 2>&1
+          rc=$?
+          {
+            echo "## 安装步骤输出（$([ "$rc" = 0 ] && echo 成功 || echo "失败，退出码 $rc")）"
+            echo '```'
+            tail -n 60 "$log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::group::安装输出（末尾 60 行）"
+          tail -n 60 "$log"
           echo "::endgroup::"
-          echo "::group::apt 依赖"
-          ok=0
-          for i in 1 2 3; do
-            if sudo apt-get update -o Acquire::Retries=3; then ok=1; break; fi
-            echo "apt-get update 第 $i 次失败，5 秒后重试"; sleep 5
-          done
-          [ "$ok" = 1 ] || { echo "!! apt-get update 三次都失败"; exit 1; }
-          sudo apt-get install -y --no-install-recommends \
-            ca-certificates wget xz-utils fonts-noto-cjk
-          echo "::endgroup::"
-          echo "::group::Calibre 安装"
-          # Calibre 官方二进制安装脚本，装到 /opt/calibre 并软链到 /usr/bin
-          # 先落到文件再执行，出错时能看清是哪一行；只打印末尾 60 行避免刷屏
-          sudo -v
-          wget -nv -O /tmp/calibre-installer.sh https://download.calibre-ebook.com/linux-installer.sh
-          sudo sh /tmp/calibre-installer.sh 2>&1 | tail -n 60
-          echo "::endgroup::"
+          if [ "$rc" != 0 ]; then echo "!! 安装失败，退出码 $rc（详细报错见本页 Summary 顶部）"; exit "$rc"; fi
           ebook-convert --version
 
       - name: 订阅源可达性自检
