@@ -17,9 +17,30 @@ CONFIG_NAMES = (
     'TOPIC_KEYWORDS',
     'EXCLUDE_TITLE',
     'SECTION_ORDER',
+    'BOOKS',
+    'DEFAULT_BOOK',
+    'CLOUD_BOOKS',
+    'NEEDS_PROXY',
+    'SCORED',
+    'REQUIRE_KEYWORD_HIT',
+    'NEEDS_ABSTRACT',
 )
 
 DEFAULT_RECIPE = 'recipes/daily-science-brief.recipe'
+
+
+def resolve_book(cfg, name):
+    """把书名解析成 (书名, [(大类, 篇数), ...])；篇数写 None 的用 QUOTA 默认值。"""
+    books = cfg.get('BOOKS') or {}
+    if name not in books:
+        available = ', '.join(sorted(books)) or '（配方里没定义 BOOKS）'
+        raise SystemExit('!! 没有叫 %s 的书。可选：%s' % (name, available))
+    title, parts = books[name]
+    resolved = []
+    for category, count in parts:
+        quota = cfg['QUOTA'].get(category, 1) if count is None else count
+        resolved.append((category, int(quota)))
+    return title, resolved
 
 
 def load(path=DEFAULT_RECIPE):

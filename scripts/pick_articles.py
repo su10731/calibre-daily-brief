@@ -35,6 +35,8 @@ import recipe_config  # noqa: E402
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/124.0 Safari/537.36')
 
+BEIJING = dt.timezone(dt.timedelta(hours=8))
+
 
 # ---------------------------------------------------------------------------
 # 抓 RSS
@@ -338,8 +340,9 @@ def build_content(item):
     return '\n'.join(parts)
 
 
-def collect(cfg, timeout, workers, verbose=True):
-    feeds = recipe_config.all_feeds(cfg)
+def collect(cfg, timeout, workers, categories=None, verbose=True):
+    feeds = [job for job in recipe_config.all_feeds(cfg)
+             if categories is None or job[0] in categories]
     pools = {cat: [] for cat in cfg['SECTION_ORDER']}
     failed = []
 
@@ -372,15 +375,17 @@ def collect(cfg, timeout, workers, verbose=True):
     return pools, failed
 
 
-def choose(cfg, pools, seen, use_history, enrich=True, now=None):
+def choose(cfg, pools, seen, use_history, parts, enrich=True, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     keywords = cfg.get('TOPIC_KEYWORDS', {})
     fresh_days = cfg.get('FRESH_DAYS', {})
     titles = cfg.get('SECTION_TITLES', {})
+    scored = set(cfg.get('SCORED', []))
+    must_hit = set(cfg.get('REQUIRE_KEYWORD_HIT', []))
+    need_body = set(cfg.get('NEEDS_ABSTRACT', []))
     skip = tuple(kw.lower() for kw in cfg.get('EXCLUDE_TITLE', []))
     sections = []
-    for category in cfg['SECTION_ORDER']:
-        quota = int(cfg['QUOTA'].get(category, 0))
+    for category, quota in parts:
         limit = fresh_days.get(category, 30)
         items = pools.get(category, [])
         fresh = []
@@ -388,24 +393,27 @@ def choose(cfg, pools, seen, use_history, enrich=True, now=None):
             when = item['when'] or now
             if (now - when).days <= limit:
                 fresh.append(item)
-            item['date'] = when.astimezone(dt.timezone(dt.timedelta(hours=8))).date().isoformat()
+            item['date'] = when.astimezone(BEIJING).date().isoformat()
         if skip:
             fresh = [it for it in fresh if not any(kw in it['title'].lower() for kw in skip)]
 
-        if category in ('frontier', 'broad'):
-            # 前沿按关键词权重排；更广一组也用同一套词，让物理/材料类新闻排在散文前面
-            def rank_key(it):
-                bonus = 1 if it['chars'] >= 300 else 0   # RSS 自带完整摘要的源略微优先
-                return (-(topic_score(it, keywords) + bonus), it['date'])
-            ranked = sorted(fresh, key=rank_key)
-            if category == 'frontier':
-                ranked = [it for it in ranked if topic_score(it, keywords) > 0]
+        if category in scored:
+            # 关键词打分排序；RSS 自带完整摘要的源略微加分（光有标题的读不了）
+            for it in fresh:
+                it['score'] = topic_score(it, keywords)
+            ranked = sorted(fresh,
+                            key=lambda it: (-(it['score'] + (1 if it['chars'] >= 300 else 0)),
+                                            it['date']))
+            if category in must_hit:
+                ranked = [it for it in ranked if it['score'] > 0]
         else:
+            for it in fresh:
+                it['score'] = 0
             ranked = sorted(fresh, key=lambda it: it['when'] or now, reverse=True)
 
         unseen = [it for it in ranked if article_id(it) not in seen] if use_history else ranked
-        if category != 'current':
-            # 够用的时候只收带正文/摘要的候选：Elsevier 的 RSS 光给标题，
+        if category in need_body:
+            # 候选够用的时候只收带正文/摘要的：Elsevier 的 RSS 光给标题，
             # 一本书里三条只有标题没法读。arXiv / IOP / Quanta 那些源每天都有货。
             rich = [it for it in unseen if it['chars'] >= 300]
             if len(rich) >= quota:
@@ -421,7 +429,6 @@ def choose(cfg, pools, seen, use_history, enrich=True, now=None):
             fill_thin_abstracts(chosen)
         for item in chosen:
             item['content'] = build_content(item)
-            item['score'] = topic_score(item, keywords) if category == 'frontier' else None
         sections.append({
             'key': category,
             'title': titles.get(category, category),
@@ -456,6 +463,8 @@ def main():
 
     ap = argparse.ArgumentParser(description='按类别配额挑选本期文章')
     ap.add_argument('--recipe', default=recipe_config.DEFAULT_RECIPE)
+    ap.add_argument('--book', help='书名，见配方里的 BOOKS；默认 %s' % 'daily')
+    ap.add_argument('--list-books', action='store_true', help='列出所有书和它们的篇数构成')
     ap.add_argument('--out', default='build/picked.json')
     ap.add_argument('--state', default='state/seen.json')
     ap.add_argument('--days', type=int, help='覆盖配方里的新鲜度窗口（所有类别用同一个值）')
@@ -467,24 +476,40 @@ def main():
     args = ap.parse_args()
 
     cfg = recipe_config.load(args.recipe)
+    book_key = args.book or cfg.get('DEFAULT_BOOK', 'daily')
+    book_title, parts = recipe_config.resolve_book(cfg, book_key)
+
+    if args.list_books:
+        print('可选的书（--book 用冒号前的键名）：')
+        for name, (title, book_parts) in cfg['BOOKS'].items():
+            text = ' + '.join('%s %s' % (cfg['SECTION_TITLES'].get(c, c),
+                                          q or cfg['QUOTA'].get(c, 1)) for c, q in book_parts)
+            print('  %-14s 《%s》  %s（共 %d 篇）'
+                  % (name, title, text, sum(q or cfg['QUOTA'].get(c, 1) for c, q in book_parts)))
+        return 0
+
     if args.days:
         cfg['FRESH_DAYS'] = {k: args.days for k in cfg['FRESH_DAYS']}
 
-    quota_text = ' + '.join('%s %d' % (cfg.get('SECTION_TITLES', {}).get(k, k), v)
-                            for k, v in cfg['QUOTA'].items())
-    feeds = recipe_config.all_feeds(cfg)
-    print('选材目标：%s（共 %d 篇），候选源 %d 个' % (quota_text, sum(cfg['QUOTA'].values()), len(feeds)))
-    pools, failed = collect(cfg, args.timeout, args.workers)
+    wanted = [c for c, _ in parts]
+    quota_text = ' + '.join('%s %d' % (cfg['SECTION_TITLES'].get(c, c), q) for c, q in parts)
+    feeds = [job for job in recipe_config.all_feeds(cfg) if job[0] in wanted]
+    proxy_hint = ''
+    needs_proxy = set(cfg.get('NEEDS_PROXY', []))
+    if any(c in needs_proxy for c in wanted):
+        proxy_hint = '（含需要代理的大类：%s）' % '、'.join(c for c in wanted if c in needs_proxy)
+    print('《%s》选材：%s（共 %d 篇），候选源 %d 个%s'
+          % (book_title, quota_text, sum(q for _, q in parts), len(feeds), proxy_hint))
+    pools, failed = collect(cfg, args.timeout, args.workers, categories=set(wanted))
 
     seen = {} if args.no_history else load_seen(args.state)
     sections = choose(cfg, pools, seen, use_history=not args.no_history,
-                      enrich=not args.no_enrich)
+                      parts=parts, enrich=not args.no_enrich)
 
     total = 0
     filled = 0
-    for section in sections:
-        print('\n== %s（%d/%d）' % (section['title'], len(section['items']),
-                                    cfg['QUOTA'].get(section['key'], 0)))
+    for section, (_, quota) in zip(sections, parts):
+        print('\n== %s（%d/%d）' % (section['title'], len(section['items']), quota))
         for item in section['items']:
             total += 1
             tag = ' [%s]' % item['score'] if item.get('score') else ''
@@ -495,7 +520,8 @@ def main():
     if filled:
         print('\n从 OpenAlex 补回了 %d 篇原本只有标题的摘要' % filled)
     if not total:
-        print('\n!! 一篇都没选到，八成是网络问题（海外源要代理）。失败源：%s' % failed[:5])
+        print('\n!! 一篇都没选到：网络不通（这一类要不要代理？），或者全部被去重挡掉。'
+              '失败源前 5 个：%s' % [name for name, _ in failed[:5]])
         return 1
 
     if failed:
@@ -507,6 +533,8 @@ def main():
         return 0
 
     payload = {
+        'book': book_title,
+        'book_key': book_key,
         'generated': dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds'),
         'sections': [{
             'key': s['key'],
@@ -530,9 +558,11 @@ def main():
         today = dt.datetime.now(dt.timezone.utc).date().isoformat()
         for section in sections:
             for item in section['items']:
+                # 同一篇新闻常被两个源用不同链接转发，标题也一起记账
                 seen[article_id(item)] = today
+                seen['t:' + norm_title(item['title'])] = today
         save_seen(args.state, seen)
-        print('已更新跨天去重记录 %s（%d 条）' % (args.state, len(seen)))
+        print('已更新去重记录 %s（%d 条）' % (args.state, len(seen)))
     return 0
 
 

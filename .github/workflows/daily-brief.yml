@@ -6,7 +6,12 @@ on:
   schedule:
     - cron: '0 0 * * *'
   # 手动触发按钮：Actions → 每日科学简报 → Run workflow
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      book:
+        description: 只出某一本书（daily / science / materials / physics / popular / tech / current_cn / current_world / essays）；留空 = 按配方 CLOUD_BOOKS 全出
+        required: false
+        default: ''
   # 改了订阅源或脚本后自动重建一次，方便验证
   push:
     paths:
@@ -101,58 +106,102 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
         continue-on-error: true
 
-      - name: 抓取新闻并生成 EPUB
+      - name: 本期要出哪几本书
+        id: books
+        run: |
+          set -uo pipefail
+          # workflow_dispatch 里填了 book 就只出那一本；定时跑按配方里的 CLOUD_BOOKS 全出
+          selected='${{ github.event.inputs.book }}'
+          if [ -n "$selected" ]; then
+            list="$selected"
+            echo "手动指定：$list"
+          else
+            list=$(python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts')
+          import recipe_config as rc
+          print(' '.join(rc.load()['CLOUD_BOOKS']))
+          PY
+          )
+            echo "按配方 CLOUD_BOOKS：$list"
+          fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+      - name: 逐本生成 EPUB
         id: build
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p out
-          book="out/daily-science-brief-${{ steps.date.outputs.tag }}.epub"
           # 纯 RSS 配方不需要 X 显示服务，这里只是保险
           export QT_QPA_PLATFORM=offscreen
-          # 选材（配额在这里）+ 排版，和本地双击 daily-brief.bat 走的是同一条路径
-          python3 scripts/build_brief.py --out "$book" --keep 1
-          test -s "$book" || { echo "!! 生成的文件是空的"; exit 1; }
-          size=$(stat -c%s "$book")
-          echo "book=$book" >> "$GITHUB_OUTPUT"
-          echo "size_mb=$(python3 -c "print(round($size/1048576, 2))")" >> "$GITHUB_OUTPUT"
+          tag='${{ steps.date.outputs.tag }}'
+          : /tmp/books.txt
+          for key in ${{ steps.books.outputs.list }}; do
+            book="out/${key}-${tag}.epub"
+            echo "================ 《$key》 ================"
+            # 一本挂了不影响其它本：选材失败、转换失败都只记 warning 继续下一本
+            if python3 scripts/build_brief.py --book "$key" --out "$book" \
+               && [ -s "$book" ]; then
+              mb=$(python3 -c "import os;print(round(os.path.getsize('$book')/1048576, 2))")
+              printf '%s\t%s\n' "$key" "$mb" >> /tmp/books.txt
+            else
+              echo "::warning::$key 这本没生成，跳过（多半是这一类的源全挂了）"
+            fi
+          done
+          if [ ! -s /tmp/books.txt ]; then
+            echo "::error::所有书都没生成，看上面日志"
+            exit 1
+          fi
           ls -lh out/
+          {
+            echo "## 本期出书"
+            echo '| 书 | 大小 MB |'
+            echo '| --- | --- |'
+            while IFS=$'\t' read -r key mb; do echo "| $key | $mb |"; done < /tmp/books.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+          total=$(du -sm out/ | cut -f1)
+          echo "total_mb=$total" >> "$GITHUB_OUTPUT"
 
       - name: 体积提醒
         run: |
-          mb='${{ steps.build.outputs.size_mb }}'
-          echo "本期大小：${mb} MB"
-          python3 - "$mb" <<'PY'
+          while IFS=$'\t' read -r key mb; do
+            echo "$key: ${mb} MB"
+            python3 - "$key" "$mb" <<'PY'
           import sys
-          mb = float(sys.argv[1])
+          key, mb = sys.argv[1], float(sys.argv[2])
           if mb > 20:
-              print('::warning::EPUB 超过 20MB，邮箱和 Kindle 可能拒收。可在配方里调小 '
-                    'max_articles_per_feed、compress_news_images_max_size 或删掉部分源。')
+              print(f'::warning::{key} 超过 20MB，邮箱和 Kindle 可能拒收；'
+                    '把配方里对应大类的 QUOTA 或 compress_news_images_max_size 调小。')
           elif mb > 10:
-              print('提示：已超过 10MB，若要发邮件建议先精简源。')
+              print(f'提示：{key} 已超过 10MB，若要发邮件建议先精简。')
           PY
+          done < /tmp/books.txt
 
       - name: 上传为 Actions 产物（保留 30 天）
         uses: actions/upload-artifact@v4
         with:
-          name: daily-science-brief-${{ steps.date.outputs.tag }}
-          path: ${{ steps.build.outputs.book }}
+          name: daily-brief-${{ steps.date.outputs.tag }}
+          path: out/*.epub
           retention-days: 30
           if-no-files-found: error
 
       - name: 归档进仓库 briefs/ 目录
         run: |
-          set -euo pipefail
+          set -uo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mkdir -p briefs
-          cp '${{ steps.build.outputs.book }}' briefs/
-          # 仓库里只保留最近 14 期，旧的自动删掉，避免越攒越大
-          ls -1t briefs/*.epub 2>/dev/null | tail -n +15 | xargs -r rm -f || true
+          cp out/*.epub briefs/
+          # 每种书各留最近 14 期，别把别的类的书删掉
+          for f in briefs/*.epub; do
+            key=$(basename "$f"); key="${key%%-*}"
+            ls -1t briefs/"${key}"-*.epub 2>/dev/null | tail -n +15 | xargs -r rm -f || true
+          done
           git add -A briefs
           if git diff --cached --quiet; then
             echo "没有需要新增归档的内容"
           else
-            git commit -m "chore(brief): ${{ steps.date.outputs.tag }} 每日科学简报"
+            git commit -m "chore(brief): ${{ steps.date.outputs.tag }} ${{ steps.books.outputs.list }}"
             git pull --rebase --autostash origin "${{ github.ref_name }}" || true
             git push origin "HEAD:${{ github.ref_name }}"
           fi
@@ -170,7 +219,7 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 邮件推送
+      - name: 邮件推送（每本书一封）
         if: steps.mail.outputs.enabled == 'true'
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -179,5 +228,11 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          MAIL_SUBJECT: '每日科学简报 ${{ steps.date.outputs.tag }}'
-        run: python3 scripts/send_email.py '${{ steps.build.outputs.book }}'
+        run: |
+          set -uo pipefail
+          tag='${{ steps.date.outputs.tag }}'
+          while IFS=$'\t' read -r key mb; do
+            # 每本书一封邮件，主题带上书名，Kindle 那边也能分得清
+            MAIL_SUBJECT="每日科学简报 $tag · $key" \
+              python3 scripts/send_email.py "out/${key}-${tag}.epub" || echo "::warning::$key 发信失败"
+          done < /tmp/books.txt
