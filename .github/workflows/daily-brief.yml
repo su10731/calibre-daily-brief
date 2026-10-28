@@ -23,7 +23,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # ubuntu-latest 正在灰度迁移到 Ubuntu 26.04（2026-10-19 起，11-19 结束），
+    # 同一个 workflow 可能落到不同镜像上，结果不可复现；这里钉死在 24.04。
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -39,11 +41,26 @@ jobs:
       - name: 安装中文字体和 Calibre
         run: |
           set -euo pipefail
-          sudo apt-get update -o Acquire::Retries=3
+          echo "::group::系统信息"
+          . /etc/os-release; echo "发行版：$PRETTY_NAME"; uname -m
+          echo "::endgroup::"
+          echo "::group::apt 依赖"
+          ok=0
+          for i in 1 2 3; do
+            if sudo apt-get update -o Acquire::Retries=3; then ok=1; break; fi
+            echo "apt-get update 第 $i 次失败，5 秒后重试"; sleep 5
+          done
+          [ "$ok" = 1 ] || { echo "!! apt-get update 三次都失败"; exit 1; }
           sudo apt-get install -y --no-install-recommends \
             ca-certificates wget xz-utils fonts-noto-cjk
+          echo "::endgroup::"
+          echo "::group::Calibre 安装"
           # Calibre 官方二进制安装脚本，装到 /opt/calibre 并软链到 /usr/bin
-          sudo -v && wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin
+          # 先落到文件再执行，出错时能看清是哪一行；只打印末尾 60 行避免刷屏
+          sudo -v
+          wget -nv -O /tmp/calibre-installer.sh https://download.calibre-ebook.com/linux-installer.sh
+          sudo sh /tmp/calibre-installer.sh 2>&1 | tail -n 60
+          echo "::endgroup::"
           ebook-convert --version
 
       - name: 订阅源可达性自检
