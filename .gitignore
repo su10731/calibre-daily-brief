@@ -5,3 +5,5 @@ __pycache__/
 .DS_Store
 # 本地手动试跑生成的书，不入库
 /*.epub
+build/
+state/

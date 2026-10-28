@@ -109,7 +109,8 @@ jobs:
           book="out/daily-science-brief-${{ steps.date.outputs.tag }}.epub"
           # 纯 RSS 配方不需要 X 显示服务，这里只是保险
           export QT_QPA_PLATFORM=offscreen
-          ebook-convert recipes/daily-science-brief.recipe "$book"
+          # 选材（配额在这里）+ 排版，和本地双击 daily-brief.bat 走的是同一条路径
+          python3 scripts/build_brief.py --out "$book" --keep 1
           test -s "$book" || { echo "!! 生成的文件是空的"; exit 1; }
           size=$(stat -c%s "$book")
           echo "book=$book" >> "$GITHUB_OUTPUT"

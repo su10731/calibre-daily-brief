@@ -2,83 +2,207 @@
 """
 每日科学简报 —— Calibre 新闻配方（RSS → EPUB）
 
-改订阅源只需要改下面的 FEEDS 列表，一行一个源：(显示名称, RSS 地址)。
-想临时停用某个源，直接在那一行前面加 # 注释掉即可，不需要动其它代码。
+本期收几篇、从哪些源收，由两个东西决定：
+  1. 下面的 QUOTA / FEED_GROUPS / TOPIC_KEYWORDS —— 选材规则（本文件是唯一出处）；
+  2. scripts/pick_articles.py —— 真正去抓 RSS、按配额挑文章，结果写进 build/picked.json；
+  3. 本文件的 parse_index() 读 picked.json，把选好的 7 篇交给 Calibre 排版。
 
-手动生成一本（需要本机装有 Calibre）：
-    cd 仓库根目录
-    ebook-convert recipes/daily-science-brief.recipe 测试.epub
+为什么不直接让 Calibre 抓 RSS：Calibre 只有 max_articles_per_feed 这一个**全局**
+开关，做不到「前沿 3 篇 + 科普 1 篇 + 物理 1 篇 + 时事 2 篇」这种按类别配额，
+所以配额交给 Python 脚本，Calibre 只负责排版和打包。
 
-GitHub Actions 里也是同一条命令，见 .github/workflows/daily-brief.yml
+手动出书（双击 daily-brief.bat，或命令行）：
+    python scripts/build_brief.py
+
+只看看本期会选哪些文章、不生成书：
+    python scripts/pick_articles.py --print-only
+
+想绕过脚本、让 Calibre 按老办法直接抓 RSS（每源最多 3 篇）：删掉 build/picked.json
+再跑 ebook-convert，parse_index 会抛 NotImplementedError 退回 Calibre 原生流程。
 """
+
+import json
+import os
 
 from calibre.web.feeds.news import BasicNewsRecipe
 
 # ---------------------------------------------------------------------------
-# 订阅源清单：科学在前，时事在后。生成的书里每个源是一个独立章节。
+# 配额：一次输出的文章总数 = 各段之和（科学 5 + 时事 2 = 7）
 # ---------------------------------------------------------------------------
-FEEDS = [
-    # ===== 科学 / 技术 =====
-    ('MIT Technology Review', 'https://www.technologyreview.com/feed/'),
-    ('Quanta Magazine', 'https://www.quantamagazine.org/feed/'),
-    ('Nature 研究速览', 'https://www.nature.com/nature.rss'),
-    ('Phys.org 科学速递', 'https://phys.org/rss-feed/'),
-    ('arXiv cs.AI', 'https://rss.arxiv.org/rss/cs.AI'),
-    ('arXiv cs.CV', 'https://rss.arxiv.org/rss/cs.CV'),
-    ('Hacker News 首页', 'https://hnrss.org/frontpage'),
-    ('雷锋网 AI', 'https://leiphone.com/feed'),
-    ('少数派', 'https://sspai.com/feed'),
-    ('科学网要闻', 'http://www.sciencenet.cn/xml/news-0.aspx?news=0'),
+QUOTA = {
+    'frontier': 3,    # 前沿研究：力学 / 机械 / 航空 / 超结构 / 智能结构 / 弹性波调控 / 非线性
+    'popular': 1,     # 科普
+    'broad': 1,       # 物理及其它更广范围
+    'current': 2,     # 时事
+}
 
-    # 其它实测可用的中文科技源，想换就取消注释：
-    # ('爱范儿', 'https://www.ifanr.com/feed'),
-    # ('InfoQ 中文', 'https://www.infoq.cn/feed'),
-    # ('开源中国资讯', 'https://www.oschina.net/news/rss'),
+SECTION_TITLES = {
+    'frontier': '前沿 · 力学与智能结构',
+    'popular': '科普 · 深度长文',
+    'broad': '物理 · 更广视野',
+    'current': '时事',
+}
+
+# 每个类别只收这么多天内的文章。期刊 in-press 列表更新慢，给宽一点；
+# 时事必须新鲜，超过两天就不要了。
+FRESH_DAYS = {
+    'frontier': 45,
+    'popular': 30,
+    'broad': 21,
+    'current': 3,
+}
+
+# ---------------------------------------------------------------------------
+# 订阅源清单：按类别分组。改源只需要改这里。
+# 想临时停用某个源，在那一行前面加 #；加新源之前先跑 scripts/check_feeds.py 验地址。
+# 下面每一条都是 2026-10-28 在本机（国内网络、未开代理）实测 200 且能解析出条目的。
+# ---------------------------------------------------------------------------
+FEED_GROUPS = {
+    # ===== 前沿研究：英文期刊 + arXiv =====
+    'frontier': [
+        # —— 弹性波 / 波动 / 非线性 ——
+        ('JMPS 机械物理固体', 'https://rss.sciencedirect.com/publication/science/00225096'),
+        ('J. Sound & Vibration', 'https://rss.sciencedirect.com/publication/science/0022460X'),
+        ('Wave Motion', 'https://rss.sciencedirect.com/publication/science/01652125'),
+        ('Int. J. Non-Linear Mech.', 'https://rss.sciencedirect.com/publication/science/00207462'),
+        # —— 力学 / 结构 ——
+        ('Int. J. Solids & Struct.', 'https://rss.sciencedirect.com/publication/science/00207683'),
+        ('Mech. Mater.', 'https://rss.sciencedirect.com/publication/science/01676636'),
+        ('Extreme Mech. Lett.', 'https://rss.sciencedirect.com/publication/science/22145095'),
+        # —— 机械 / 振动工程 ——
+        ('Mech. Syst. Signal Pr.', 'https://rss.sciencedirect.com/publication/science/08883270'),
+        ('Int. J. Mech. Sci.', 'https://rss.sciencedirect.com/publication/science/00207403'),
+        # —— 航空 / 薄壁 / 复合材料 / 增材 ——
+        ('Aerosp. Sci. Technol.', 'https://rss.sciencedirect.com/publication/science/12709638'),
+        ('Thin-Walled Struct.', 'https://rss.sciencedirect.com/publication/science/02638231'),
+        ('Composite Struct.', 'https://rss.sciencedirect.com/publication/science/02638223'),
+        ('Compos. Part B-Eng.', 'https://rss.sciencedirect.com/publication/science/13598368'),
+        ('Additive Manufacturing', 'https://rss.sciencedirect.com/publication/science/22148604'),
+        ('Carbon', 'https://rss.sciencedirect.com/publication/science/00086223'),
+        # —— 智能结构 / 超材料（IOP）——
+        ('Smart Mater. Struct.', 'https://iopscience.iop.org/journal/rss/0964-1726'),
+        ('New J. Phys.', 'https://iopscience.iop.org/journal/rss/1367-2630'),
+        # —— arXiv 预印本：当天新投稿，弹性波调控/超结构/非线性最多的地方 ——
+        ('arXiv physics.app-ph', 'https://rss.arxiv.org/rss/physics.app-ph'),
+        ('arXiv physics.class-ph', 'https://rss.arxiv.org/rss/physics.class-ph'),
+        ('arXiv nlin', 'https://rss.arxiv.org/rss/nlin'),
+        ('arXiv cond-mat.mtrl-sci', 'https://rss.arxiv.org/rss/cond-mat.mtrl-sci'),
+        # —— 顶刊里的结构/材料前沿 ——
+        ('Nature Materials', 'https://www.nature.com/nmat.rss'),
+        ('Sci. Rep.', 'https://www.nature.com/srep.rss'),
+        ('Phys. Lett. A', 'https://rss.sciencedirect.com/publication/science/03759601'),
+
+        # 需要代理才能通的候选（本机未开代理时全失败，开了再取消注释）：
+        # ('PRL (APS)', 'https://journals.aps.org/prl/rss'),
+    ],
+
+    # ===== 科普 =====
+    'popular': [
+        ('Quanta Magazine', 'https://www.quantamagazine.org/feed/'),
+        ('MIT Technology Review', 'https://www.technologyreview.com/feed/'),
+        ('Physics World', 'https://physicsworld.com/feed/'),
+        ('New Scientist', 'https://www.newscientist.com/feed/home/'),
+    ],
+
+    # ===== 物理及其它更广范围 =====
+    'broad': [
+        ('Phys.org 科学速递', 'https://phys.org/rss-feed/'),
+        ('Nature 研究速览', 'https://www.nature.com/nature.rss'),
+        ('科学网要闻', 'http://www.sciencenet.cn/xml/news-0.aspx?news=0'),
+    ],
 
     # ===== 时事 =====
-    ('The Guardian World', 'https://www.theguardian.com/world/rss'),
-    ('BBC World', 'https://feeds.bbci.co.uk/news/world/rss.xml'),
-    ('Google News 中文科学',
-     'https://news.google.com/rss/search?q=%E7%A7%91%E5%AD%A6%E6%96%B0%E9%97%BB&hl=zh-CN&gl=CN&ceid=CN:zh-Hans'),
+    'current': [
+        ('中新网 即时新闻', 'https://www.chinanews.com/rss/importnews.xml'),
+        ('中新网 滚动新闻', 'https://www.chinanews.com.cn/rss/scroll-news.xml'),
+        ('界面新闻', 'https://a.jiemian.com/index.php?m=article&a=rss'),
+        ('Solidot 奇客', 'https://www.solidot.org/index.rss'),
+        ('Hacker News 首页', 'https://hnrss.org/frontpage'),
+        ('爱范儿', 'https://www.ifanr.com/feed'),
 
-    # ===== 依赖 RSSHub 的中文源（默认关闭） =====
-    # 公共实例 rsshub.app 对云端 IP 经常返回 403，自建 RSSHub 后再打开更稳。
-    # ('澎湃新闻', 'https://rsshub.app/thepaper/featured'),
-    # ('知乎热榜', 'https://rsshub.app/zhihu/hot'),
-    # ('Readhub 热点', 'https://rsshub.app/readhub/topic'),
+        # 需要代理：
+        # ('The Guardian World', 'https://www.theguardian.com/world/rss'),
+        # ('BBC World', 'https://feeds.bbci.co.uk/news/world/rss.xml'),
+        # ('Google News 中文科学',
+        #  'https://news.google.com/rss/search?q=%E7%A7%91%E5%AD%A6%E6%96%B0%E9%97%BB&hl=zh-CN&gl=CN&ceid=CN:zh-Hans'),
+    ],
+}
 
-    # ===== 已失效，保留说明避免踩坑 =====
-    # Reuters 官方 RSS 已于 2020 年下线，用 Google News 关键词源替代：
-    # ('Reuters', 'https://feeds.reuters.com/reuters/topNews'),
-    # 机器之心 /feed 和 36氪 /feed 现在返回的是 HTML 页面而不是 RSS，收录会空章节：
-    # ('机器之心', 'https://www.jiqizhixin.com/rss'),
-    # ('36氪', 'https://36kr.com/feed'),
+# ---------------------------------------------------------------------------
+# 前沿类别的选题关键词。命中标题按 3 倍计权，命中摘要按 1 倍。
+# strong = 直接对口（这些命中一条就基本能入选）；weak = 沾边（用来在同类里排序）。
+# ---------------------------------------------------------------------------
+TOPIC_KEYWORDS = {
+    'strong': [
+        # 超材料 / 超结构 / 声学器件
+        'metamaterial', 'meta-material', 'metastructure', 'meta-structure', 'metasurface',
+        'phononic', 'acoustic crystal', 'band gap', 'bandgap', 'locally resonant',
+        'auxetic', 'negative stiffness', 'negative poisson', 'zero Poisson',
+        'kirigami', 'origami', 'mechanical lattice', 'lattice structure', 'hierarchical structure',
+        # 弹性波调控
+        'elastic wave', 'acoustic wave', 'flexural wave', 'lamb wave', 'rayleigh wave',
+        'shear wave', 'wave manipulation', 'wave guiding', 'wave focusing', 'cloaking',
+        'topological mechanic', 'topological acoustic', 'topological phonon', 'edge state',
+        'vibration isolation', 'vibration control', 'energy harvesting', 'wave absorp',
+        # 智能结构 / 主动控制
+        'smart structure', 'adaptive structure', 'shape memory', 'piezoelectric',
+        'magnetorheological', 'electrorheological', 'tunable', 'programmable material',
+        'self-sensing', 'self-healing', 'active control', 'morphing', '4d printing',
+        # 非线性
+        'nonlinear vibration', 'soliton', 'chaos', 'bifurcation', 'internal resonance',
+        'snap-through', 'bistable', 'multistable', 'frequency comb', 'nonlinear dynamic',
+        # 中文等价词
+        '超材料', '超结构', '声学黑洞', '弹性波', '波调控', '带隙', '智能结构', '压电',
+        '减振', '隔振', '非线性振动', '拓扑', '负泊松', '可编程', '变刚度', '能量俘获',
+    ],
+    'weak': [
+        'mechanic', 'composite', 'laminate', 'shell', 'plate', 'membrane', 'beam',
+        'vibration', 'wave', 'buckling', 'flutter', 'aerospace', 'aircraft', 'wing',
+        'structural', 'microstructure', 'fatigue', 'fracture', 'impact', 'crashworthiness',
+        'stiffness', 'damping', 'resonance', 'mode shape', 'optimization',
+        '力学', '复合材料', '结构', '振动', '航空', '航天', '刚度', '阻尼', '优化',
+    ],
+}
+
+# 每天的"合集/日报"类标题会占掉唯一一格的科普位，看到这些词直接跳过
+EXCLUDE_TITLE = [
+    'the download', 'week in review', 'roundup', 'newsletter', 'this week in',
+    '每日', '周报', '合集', '汇总', '一览', '盘点',
 ]
+
+# 章节标题 → 类别，供 parse_index 复原顺序（书里的章节顺序就是这里的顺序）
+SECTION_ORDER = ['frontier', 'popular', 'broad', 'current']
 
 
 class DailyScienceBrief(BasicNewsRecipe):
     title = '每日科学简报'
-    description = '科学与时事 RSS 聚合日报，由 GitHub Actions 定时生成'
+    description = '力学 / 智能结构 / 弹性波方向的前沿速递 + 科普 + 时事，每期 7 篇'
     __author__ = 'daily-brief'
-    language = 'zho'                 # ISO-639，主体面向中文读者；想改成英文设 'eng'
+    language = 'zho'                 # ISO-639；主体中文
     publication_type = 'newspaper'   # newspaper / magazine / blog
-    timefmt = ' [%Y-%m-%d]'          # 刊头日期的显示格式（Calibre 用这个字段，不是旧教程里的 timeofprint）
+    timefmt = ' [%Y-%m-%d]'
 
-    # ---- 抓取量控制：一天一本，控制在几十篇以内 ----
-    max_articles_per_feed = 8        # 每个源最多取几篇（Calibre 只支持全局设置这一项）
-    oldest_article = 3.0             # 只取 3 天内的文章
-    remove_empty_feeds = True        # 当天某源没更新就不留空章节
-    ignore_duplicate_articles = {'title', 'url'}   # 同一天内去重（跨天去重见 README）
-    simultaneous_downloads = 3       # 对方限流/403 时改成 1
+    # ---- 抓取量控制 ----
+    # 正常流程下篇数由 scripts/pick_articles.py 的 QUOTA 决定，这里只是兜底上限：
+    # 万一 picked.json 不存在、退回 Calibre 原生抓 RSS，每源也最多 3 篇。
+    max_articles_per_feed = 3
+    oldest_article = 45.0            # 只取 45 天内的文章（pick 阶段已按类别各自过滤）
+    remove_empty_feeds = True
+    ignore_duplicate_articles = {'title', 'url'}
+    simultaneous_downloads = 3
     timeout = 60.0
+
+    # ---- 正文来源 ----
+    # True = 用 RSS 自带的摘要/正文，不再去抓网页。
+    # 期刊 RSS 给的就是完整摘要，够读；好处是不触发出版社反爬，本地一秒出书。
+    # 想读全文改成 False（代价：慢，且遇到反爬会丢章节）。
+    use_embedded_content = True
 
     # ---- 体积控制：邮件附件和 Kindle 传输都有大小限制 ----
     compress_news_images = True
     compress_news_images_max_size = 120   # 单张图片最大 120 KB
-    scale_news_images = (800, 800)        # 图片最大边长
-    # PNG 会被自动转成 JPEG，这是 Calibre 的压缩策略，正常现象
+    scale_news_images = (800, 800)
 
-    # ---- 转换选项（键名就是 ebook-convert 的选项名） ----
     conversion_options = {
         'base_font_size': 13,
         'linearize_tables': True,
@@ -86,6 +210,44 @@ class DailyScienceBrief(BasicNewsRecipe):
 
     extra_css = 'body { line-height: 1.65; }\n' \
                 'h1, h2, h3 { line-height: 1.3; }\n' \
-                'img { max-width: 100%; }\n'
+                'img { max-width: 100%; }\n' \
+                '.picked-meta { color: #666; font-size: 0.9em; }\n'
 
-    feeds = FEEDS
+    # 兜底路径用的平铺清单（picked.json 存在时不会走到这里）
+    feeds = [pair for group in SECTION_ORDER for pair in FEED_GROUPS[group]]
+
+    # ---------------------------------------------------------------------
+    # 真正的入口：读 pick_articles.py 写好的 build/picked.json
+    # ---------------------------------------------------------------------
+    def parse_index(self):
+        path = os.environ.get('BRIEF_PICKED') or os.path.join('build', 'picked.json')
+        if not os.path.exists(path):
+            # 抛这个异常，Calibre 会退回 parse_feeds()，即按 self.feeds 直接抓 RSS
+            print('!! 没找到 %s，退回 Calibre 原生逐源抓取' % path)
+            raise NotImplementedError('no picked.json')
+
+        with open(path, encoding='utf-8') as fh:
+            data = json.load(fh)
+
+        index = []
+        for section in data.get('sections', []):
+            articles = []
+            for item in section.get('items', []):
+                articles.append({
+                    'title': item['title'],
+                    'url': item['url'],
+                    'author': item.get('author') or item.get('source') or '',
+                    'date': ' [%s]' % item.get('date', ''),
+                    'content': item.get('content') or '',
+                    'description': item.get('content') or '',
+                })
+            if articles:
+                index.append((section['title'], articles))
+
+        if not index:
+            print('!! %s 里没有任何条目，退回逐源抓取' % path)
+            raise NotImplementedError('picked.json is empty')
+
+        print('本期从 %s 读取选材结果，共 %d 篇' % (
+            path, sum(len(a) for _, a in index)))
+        return index
