@@ -40,44 +40,53 @@ jobs:
 
       - name: 安装中文字体和 Calibre
         run: |
-          # 注意：这里故意不加 -e。整段安装先跑完并留日志，最后再决定退出码。
-          # 关键报错额外用 ::error:: 打成 annotation —— annotation 是公开的，
-          # 而 Actions 日志正文要登录才能看，这样不登录也能定位问题。
-          set -uo pipefail
+          # 关键：GitHub 用 `bash -e {0}` 执行 run 块，任何一条命令返回非 0 都会
+          # 立刻终止整个脚本 —— 那样后面的日志打印和 Summary 根本跑不到（前三次
+          # 失败查不到原因就是这个）。所以这里先 set +e，自己收集退出码。
+          set +e
           log=/tmp/install.log
           {
-            . /etc/os-release; echo "发行版：$PRETTY_NAME"; uname -m
+            . /etc/os-release
+            echo "发行版：$PRETTY_NAME / $(uname -m)"
+            echo "--- apt 依赖 ---"
             sudo apt-get update -o Acquire::Retries=3
+            echo "[apt update 退出码 $?]"
             sudo apt-get install -y --no-install-recommends \
               ca-certificates wget xz-utils fonts-noto-cjk
+            echo "[apt install 退出码 $?]"
+            echo "--- 下载安装脚本 ---"
             sudo -v
             wget -nv -O /tmp/calibre-installer.sh https://download.calibre-ebook.com/linux-installer.sh
-            echo "--- 安装脚本前 3 行（用来判断 wget 拿到的是脚本还是 HTML）---"
+            echo "[wget 退出码 $?]"
+            echo "脚本前 3 行："
             head -n 3 /tmp/calibre-installer.sh
-            echo "--- 开始执行 ---"
+            echo "--- 执行官方安装脚本 ---"
             sudo bash /tmp/calibre-installer.sh
+            echo "[installer 退出码 $?]"
           } > "$log" 2>&1
-          rc=$?
-          if [ "$rc" != 0 ]; then
-            echo "!! 官方安装脚本失败（退出码 $rc），改用 apt 里的 calibre 兜底"
-            sudo apt-get install -y --no-install-recommends calibre >> "$log" 2>&1
-            rc2=$?
-            [ "$rc2" = 0 ] && rc=0 || rc="$rc2"
-            echo "兜底结果退出码：$rc2" >> "$log"
+
+          if ! command -v ebook-convert >/dev/null 2>&1; then
+            { echo "--- 官方脚本没装上，改用 apt 的 calibre 兜底 ---"
+              sudo apt-get install -y --no-install-recommends calibre
+              echo "[apt calibre 退出码 $?]"; } >> "$log" 2>&1
           fi
-          brief=$(tail -n 14 "$log" | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} NR>1{printf "%%0A"} {print}')
-          if [ "$rc" = 0 ]; then
-            echo "::notice::Calibre 安装成功：$(ebook-convert --version 2>/dev/null | head -n 1)"
+
+          ok=1
+          command -v ebook-convert >/dev/null 2>&1 || ok=0
+          ebook-convert --version >/dev/null 2>&1 || ok=0
+          status=成功
+          [ "$ok" = 1 ] || status=失败
+
+          # annotation 走公开接口，不登录也能读到；截断到 1800 字节防止被丢弃
+          brief=$(tail -n 20 "$log" | tail -c 1800 | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} NR>1{printf "%%0A"} {print}')
+          if [ "$ok" = 1 ]; then
+            echo "::notice::Calibre 就绪：$(ebook-convert --version | head -n 1)"
           else
-            echo "::error::安装失败（退出码 $rc），日志末尾：$brief"
+            echo "::error::安装失败，日志末尾：$brief"
           fi
-          {
-            echo "## 安装步骤输出（$([ "$rc" = 0 ] && echo 成功 || echo "失败，退出码 $rc")）"
-            echo '```'
-            tail -n 60 "$log"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          [ "$rc" = 0 ] || exit "$rc"
+          { echo "## 安装步骤输出：$status"; echo '```'; tail -n 80 "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "安装结果：$status"
+          [ "$ok" = 1 ] || exit 1
           ebook-convert --version
 
       - name: 订阅源可达性自检
