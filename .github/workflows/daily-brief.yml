@@ -1,0 +1,139 @@
+name: 每日科学简报
+
+# 定时：每天 UTC 00:00（= 北京时间 08:00）跑一次。
+# GitHub Actions 的 cron 用的是 UTC，改时间记得减 8 小时。
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  # 手动触发按钮：Actions → 每日科学简报 → Run workflow
+  workflow_dispatch: {}
+  # 改了订阅源或脚本后自动重建一次，方便验证
+  push:
+    paths:
+      - 'recipes/**'
+      - 'scripts/**'
+      - '.github/workflows/daily-brief.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-brief
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 计算当天日期（北京时间）
+        id: date
+        run: echo "tag=$(TZ=Asia/Shanghai date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: 安装中文字体和 Calibre
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates wget xz-utils fonts-noto-cjk
+          # Calibre 官方二进制安装脚本，装到 /opt/calibre 并软链到 /usr/bin
+          sudo -v && wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin
+          ebook-convert --version
+
+      - name: 订阅源可达性自检
+        run: |
+          set -uo pipefail
+          python3 scripts/check_feeds.py recipes/daily-science-brief.recipe | tee out-check.txt || true
+          {
+            echo "## 订阅源自检（runner 侧结果）"
+            echo '```'
+            cat out-check.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        continue-on-error: true
+
+      - name: 抓取新闻并生成 EPUB
+        id: build
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          book="out/daily-science-brief-${{ steps.date.outputs.tag }}.epub"
+          # 纯 RSS 配方不需要 X 显示服务，这里只是保险
+          export QT_QPA_PLATFORM=offscreen
+          ebook-convert recipes/daily-science-brief.recipe "$book"
+          test -s "$book" || { echo "!! 生成的文件是空的"; exit 1; }
+          size=$(stat -c%s "$book")
+          echo "book=$book" >> "$GITHUB_OUTPUT"
+          echo "size_mb=$(python3 -c "print(round($size/1048576, 2))")" >> "$GITHUB_OUTPUT"
+          ls -lh out/
+
+      - name: 体积提醒
+        run: |
+          mb='${{ steps.build.outputs.size_mb }}'
+          echo "本期大小：${mb} MB"
+          python3 - "$mb" <<'PY'
+          import sys
+          mb = float(sys.argv[1])
+          if mb > 20:
+              print('::warning::EPUB 超过 20MB，邮箱和 Kindle 可能拒收。可在配方里调小 '
+                    'max_articles_per_feed、compress_news_images_max_size 或删掉部分源。')
+          elif mb > 10:
+              print('提示：已超过 10MB，若要发邮件建议先精简源。')
+          PY
+
+      - name: 上传为 Actions 产物（保留 30 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-science-brief-${{ steps.date.outputs.tag }}
+          path: ${{ steps.build.outputs.book }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 归档进仓库 briefs/ 目录
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p briefs
+          cp '${{ steps.build.outputs.book }}' briefs/
+          # 仓库里只保留最近 14 期，旧的自动删掉，避免越攒越大
+          ls -1t briefs/*.epub 2>/dev/null | tail -n +15 | xargs -r rm -f || true
+          git add -A briefs
+          if git diff --cached --quiet; then
+            echo "没有需要新增归档的内容"
+          else
+            git commit -m "chore(brief): ${{ steps.date.outputs.tag }} 每日科学简报"
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+
+      # 下面两步默认不执行：只在仓库里配好 SMTP Secrets 后自动启用
+      - name: 检测是否配置了邮件推送
+        id: mail
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+        run: |
+          if [ -n "${SMTP_HOST:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "SMTP_HOST 未配置，跳过发邮件。本期已存入 briefs/ 和 Actions 产物。"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 邮件推送
+        if: steps.mail.outputs.enabled == 'true'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_SUBJECT: '每日科学简报 ${{ steps.date.outputs.tag }}'
+        run: python3 scripts/send_email.py '${{ steps.build.outputs.book }}'

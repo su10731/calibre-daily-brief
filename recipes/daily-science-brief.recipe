@@ -1,0 +1,91 @@
+# -*- coding: utf-8 -*-
+"""
+每日科学简报 —— Calibre 新闻配方（RSS → EPUB）
+
+改订阅源只需要改下面的 FEEDS 列表，一行一个源：(显示名称, RSS 地址)。
+想临时停用某个源，直接在那一行前面加 # 注释掉即可，不需要动其它代码。
+
+手动生成一本（需要本机装有 Calibre）：
+    cd 仓库根目录
+    ebook-convert recipes/daily-science-brief.recipe 测试.epub
+
+GitHub Actions 里也是同一条命令，见 .github/workflows/daily-brief.yml
+"""
+
+from calibre.web.feeds.news import BasicNewsRecipe
+
+# ---------------------------------------------------------------------------
+# 订阅源清单：科学在前，时事在后。生成的书里每个源是一个独立章节。
+# ---------------------------------------------------------------------------
+FEEDS = [
+    # ===== 科学 / 技术 =====
+    ('MIT Technology Review', 'https://www.technologyreview.com/feed/'),
+    ('Quanta Magazine', 'https://www.quantamagazine.org/feed/'),
+    ('Nature 研究速览', 'https://www.nature.com/nature.rss'),
+    ('Phys.org 科学速递', 'https://phys.org/rss-feed/'),
+    ('arXiv cs.AI', 'https://rss.arxiv.org/rss/cs.AI'),
+    ('arXiv cs.CV', 'https://rss.arxiv.org/rss/cs.CV'),
+    ('Hacker News 首页', 'https://hnrss.org/frontpage'),
+    ('雷锋网 AI', 'https://leiphone.com/feed'),
+    ('少数派', 'https://sspai.com/feed'),
+    ('科学网要闻', 'http://www.sciencenet.cn/xml/news-0.aspx?news=0'),
+
+    # 其它实测可用的中文科技源，想换就取消注释：
+    # ('爱范儿', 'https://www.ifanr.com/feed'),
+    # ('InfoQ 中文', 'https://www.infoq.cn/feed'),
+    # ('开源中国资讯', 'https://www.oschina.net/news/rss'),
+
+    # ===== 时事 =====
+    ('The Guardian World', 'https://www.theguardian.com/world/rss'),
+    ('BBC World', 'https://feeds.bbci.co.uk/news/world/rss.xml'),
+    ('Google News 中文科学',
+     'https://news.google.com/rss/search?q=%E7%A7%91%E5%AD%A6%E6%96%B0%E9%97%BB&hl=zh-CN&gl=CN&ceid=CN:zh-Hans'),
+
+    # ===== 依赖 RSSHub 的中文源（默认关闭） =====
+    # 公共实例 rsshub.app 对云端 IP 经常返回 403，自建 RSSHub 后再打开更稳。
+    # ('澎湃新闻', 'https://rsshub.app/thepaper/featured'),
+    # ('知乎热榜', 'https://rsshub.app/zhihu/hot'),
+    # ('Readhub 热点', 'https://rsshub.app/readhub/topic'),
+
+    # ===== 已失效，保留说明避免踩坑 =====
+    # Reuters 官方 RSS 已于 2020 年下线，用 Google News 关键词源替代：
+    # ('Reuters', 'https://feeds.reuters.com/reuters/topNews'),
+    # 机器之心 /feed 和 36氪 /feed 现在返回的是 HTML 页面而不是 RSS，收录会空章节：
+    # ('机器之心', 'https://www.jiqizhixin.com/rss'),
+    # ('36氪', 'https://36kr.com/feed'),
+]
+
+
+class DailyScienceBrief(BasicNewsRecipe):
+    title = '每日科学简报'
+    description = '科学与时事 RSS 聚合日报，由 GitHub Actions 定时生成'
+    __author__ = 'daily-brief'
+    language = 'zho'                 # ISO-639，主体面向中文读者；想改成英文设 'eng'
+    publication_type = 'newspaper'   # newspaper / magazine / blog
+    timefmt = ' [%Y-%m-%d]'          # 刊头日期的显示格式（Calibre 用这个字段，不是旧教程里的 timeofprint）
+
+    # ---- 抓取量控制：一天一本，控制在几十篇以内 ----
+    max_articles_per_feed = 8        # 每个源最多取几篇（Calibre 只支持全局设置这一项）
+    oldest_article = 3.0             # 只取 3 天内的文章
+    remove_empty_feeds = True        # 当天某源没更新就不留空章节
+    ignore_duplicate_articles = {'title', 'url'}   # 同一天内去重（跨天去重见 README）
+    simultaneous_downloads = 3       # 对方限流/403 时改成 1
+    timeout = 60.0
+
+    # ---- 体积控制：邮件附件和 Kindle 传输都有大小限制 ----
+    compress_news_images = True
+    compress_news_images_max_size = 120   # 单张图片最大 120 KB
+    scale_news_images = (800, 800)        # 图片最大边长
+    # PNG 会被自动转成 JPEG，这是 Calibre 的压缩策略，正常现象
+
+    # ---- 转换选项（键名就是 ebook-convert 的选项名） ----
+    conversion_options = {
+        'base_font_size': 13,
+        'linearize_tables': True,
+    }
+
+    extra_css = 'body { line-height: 1.65; }\n' \
+                'h1, h2, h3 { line-height: 1.3; }\n' \
+                'img { max-width: 100%; }\n'
+
+    feeds = FEEDS
