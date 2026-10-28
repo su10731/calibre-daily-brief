@@ -40,8 +40,9 @@ jobs:
 
       - name: 安装中文字体和 Calibre
         run: |
-          # 注意：这里故意不加 -e。整段安装先跑完并留日志，最后再决定退出码，
-          # 目的是把真实报错写进 Job Summary（公开可见），而不是只留在需要登录才能看的日志里。
+          # 注意：这里故意不加 -e。整段安装先跑完并留日志，最后再决定退出码。
+          # 关键报错额外用 ::error:: 打成 annotation —— annotation 是公开的，
+          # 而 Actions 日志正文要登录才能看，这样不登录也能定位问题。
           set -uo pipefail
           log=/tmp/install.log
           {
@@ -51,20 +52,32 @@ jobs:
               ca-certificates wget xz-utils fonts-noto-cjk
             sudo -v
             wget -nv -O /tmp/calibre-installer.sh https://download.calibre-ebook.com/linux-installer.sh
-            echo "安装脚本首行：$(head -n 1 /tmp/calibre-installer.sh)"
+            echo "--- 安装脚本前 3 行（用来判断 wget 拿到的是脚本还是 HTML）---"
+            head -n 3 /tmp/calibre-installer.sh
+            echo "--- 开始执行 ---"
             sudo bash /tmp/calibre-installer.sh
           } > "$log" 2>&1
           rc=$?
+          if [ "$rc" != 0 ]; then
+            echo "!! 官方安装脚本失败（退出码 $rc），改用 apt 里的 calibre 兜底"
+            sudo apt-get install -y --no-install-recommends calibre >> "$log" 2>&1
+            rc2=$?
+            [ "$rc2" = 0 ] && rc=0 || rc="$rc2"
+            echo "兜底结果退出码：$rc2" >> "$log"
+          fi
+          brief=$(tail -n 14 "$log" | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} NR>1{printf "%%0A"} {print}')
+          if [ "$rc" = 0 ]; then
+            echo "::notice::Calibre 安装成功：$(ebook-convert --version 2>/dev/null | head -n 1)"
+          else
+            echo "::error::安装失败（退出码 $rc），日志末尾：$brief"
+          fi
           {
             echo "## 安装步骤输出（$([ "$rc" = 0 ] && echo 成功 || echo "失败，退出码 $rc")）"
             echo '```'
             tail -n 60 "$log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::group::安装输出（末尾 60 行）"
-          tail -n 60 "$log"
-          echo "::endgroup::"
-          if [ "$rc" != 0 ]; then echo "!! 安装失败，退出码 $rc（详细报错见本页 Summary 顶部）"; exit "$rc"; fi
+          [ "$rc" = 0 ] || exit "$rc"
           ebook-convert --version
 
       - name: 订阅源可达性自检
